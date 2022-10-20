@@ -1,10 +1,6 @@
 import numpy as np
-
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
-
-def mse(output, target):
-    return np.sum(0.5 * (target - output)**2)
+import numba
+import numba.types as nt
 
 def normalize(data, normMin=.15, normMax=.85):
     normalizedData = data - np.min(data)
@@ -12,35 +8,57 @@ def normalize(data, normMin=.15, normMax=.85):
     
     return normalizedData
 
+@numba.njit()
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+@numba.njit()
+def mse(output, target):
+    return np.sum(0.5 * (target - output)**2)
+
+spec = [
+    ('inputDim', nt.int32),
+    ('contextDim', nt.int32),
+    ('outputDim', nt.int32),
+    ('learningRate', nt.float64),
+    ('loadPath', nt.unicode_type),
+    ('Wux', nt.float64[:,:]),
+    ('Wuc', nt.float64[:,:]),
+    ('Wvc', nt.float64[:,:]),
+    ('bu', nt.float64[:]),
+    ('bv', nt.float64[:]),
+    ('dEdWux', nt.float64[:,:]),
+    ('dEdWuc', nt.float64[:,:]),
+    ('dEdWvc', nt.float64[:,:]),
+    ('dEdbu', nt.float64[:]),
+    ('dEdbv', nt.float64[:]),
+    ('predictionSteps', nt.int32),
+]
+
+@numba.experimental.jitclass(spec)
 class ElmanNetwork():
     
-    def __init__(self, inputDim=None, contextDim=None, outputDim=None, learningRate=None, loadPath=None):
+    def __init__(self, inputDim=None, contextDim=None, outputDim=None, learningRate=None):
         
-        if not loadPath:
             self.inputDim = inputDim
             self.contextDim = contextDim # Aka hidden layer dim
             self.outputDim = outputDim
             self.learningRate = learningRate
                         
             self.initialize()
-        else:
-            self.load(loadPath)
             
     def initialize(self):
         """
         Initialize the weights and biases by sampling from a 
         standard normal distribution.
         """
-        self.Wux = np.random.normal(size=(self.contextDim, self.inputDim))
-        self.Wuc = np.random.normal(size=(self.contextDim, self.contextDim))
-        self.Wvc = np.random.normal(size=(self.outputDim, self.contextDim))
+        self.Wux = np.ascontiguousarray(np.random.randn(self.contextDim, self.inputDim))
+        self.Wuc = np.ascontiguousarray(np.random.randn(self.contextDim, self.contextDim))
+        self.Wvc = np.ascontiguousarray(np.random.randn(self.outputDim, self.contextDim))
         
-        self.bu = np.random.normal(size=(self.contextDim))
-        self.bv = np.random.normal(size=(self.outputDim))
+        self.bu = np.ascontiguousarray(np.random.randn(self.contextDim))
+        self.bv = np.ascontiguousarray(np.random.randn(self.outputDim))
         
-        self.activation = sigmoid
-        self.error = mse
-            
         # Set all gradients to zero
         self._resetGradients()
     
@@ -66,9 +84,9 @@ class ElmanNetwork():
             The output values for the current time step, t.
         """
         u = self.Wux @ inputArr + self.Wuc @ prevContextArr + self.bu
-        c = self.activation(u)
+        c = sigmoid(u)
         v = self.Wvc @ c + self.bv
-        o = self.activation(v)
+        o = sigmoid(v)
         return c, o
     
     
@@ -108,11 +126,11 @@ class ElmanNetwork():
         Set all gradients to zero, presumably after updating learning parameters.
         """
         # Set all of the gradients to zero
-        self.dEdWuc = np.zeros_like(self.Wuc)
-        self.dEdWux = np.zeros_like(self.Wux)
-        self.dEdWvc = np.zeros_like(self.Wvc)
-        self.dEdbu = np.zeros_like(self.bu)
-        self.dEdbv = np.zeros_like(self.bv)
+        self.dEdWuc = np.ascontiguousarray(np.zeros_like(self.Wuc))
+        self.dEdWux = np.ascontiguousarray(np.zeros_like(self.Wux))
+        self.dEdWvc = np.ascontiguousarray(np.zeros_like(self.Wvc))
+        self.dEdbu = np.ascontiguousarray(np.zeros_like(self.bu))
+        self.dEdbv = np.ascontiguousarray(np.zeros_like(self.bv))
     
     
     def _backwardStep(self, inputArr, contextArr, outputArr, targetArr, prevContextArr, prevdEdu):
@@ -223,7 +241,7 @@ class ElmanNetwork():
         self._resetGradients()
         
         # Count down from last time step to first and compute gradients
-        for i in range(T)[::-1]:
+        for i in sorted(range(T), reverse=True):
             # Compute gradients for learnable quantities
             dEdu[i] = self._backwardStep(inputArr[i].reshape(-1, 1),
                                          contextArr[i].reshape(-1, 1),
@@ -288,7 +306,6 @@ class ElmanNetwork():
         return outputArr
         
     
- 
 def save(self, file):
     """
     Saves the trained network parameters to a file.
