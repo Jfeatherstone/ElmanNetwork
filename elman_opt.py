@@ -21,7 +21,9 @@ spec = [
     ('contextDim', nt.int32),
     ('outputDim', nt.int32),
     ('learningRate', nt.float64),
-    ('loadPath', nt.unicode_type),
+    ('beta1', nt.float64),
+    ('beta2', nt.float64),
+    ('t', nt.int32),
     ('Wux', nt.float64[:,:]),
     ('Wuc', nt.float64[:,:]),
     ('Wvc', nt.float64[:,:]),
@@ -32,18 +34,31 @@ spec = [
     ('dEdWvc', nt.float64[:,:]),
     ('dEdbu', nt.float64[:]),
     ('dEdbv', nt.float64[:]),
+    ('m_dEdWux', nt.float64[:,:]),
+    ('m_dEdWuc', nt.float64[:,:]),
+    ('m_dEdWvc', nt.float64[:,:]),
+    ('m_dEdbu', nt.float64[:]),
+    ('m_dEdbv', nt.float64[:]),
+    ('v_dEdWux', nt.float64[:,:]),
+    ('v_dEdWuc', nt.float64[:,:]),
+    ('v_dEdWvc', nt.float64[:,:]),
+    ('v_dEdbu', nt.float64[:]),
+    ('v_dEdbv', nt.float64[:]),
     ('predictionSteps', nt.int32),
 ]
 
 @numba.experimental.jitclass(spec)
 class ElmanNetwork():
     
-    def __init__(self, inputDim=None, contextDim=None, outputDim=None, learningRate=None):
+    def __init__(self, inputDim=None, contextDim=None, outputDim=None, learningRate=None, beta1=.9, beta2=.999):
         
             self.inputDim = inputDim
             self.contextDim = contextDim # Aka hidden layer dim
             self.outputDim = outputDim
             self.learningRate = learningRate
+            # Adam parameters
+            self.beta1 = beta1
+            self.beta2 = beta2
                         
             self.initialize()
             
@@ -58,7 +73,26 @@ class ElmanNetwork():
         
         self.bu = np.ascontiguousarray(np.random.randn(self.contextDim))
         self.bv = np.ascontiguousarray(np.random.randn(self.outputDim))
+
+        # Set the momentum terms for adam
+        self.m_dEdWux = np.zeros_like(self.Wux)
+        self.m_dEdWuc = np.zeros_like(self.Wuc)
+        self.m_dEdWvc = np.zeros_like(self.Wvc)
         
+        self.v_dEdWux = np.zeros_like(self.Wux)
+        self.v_dEdWuc = np.zeros_like(self.Wuc)
+        self.v_dEdWvc = np.zeros_like(self.Wvc)
+
+        self.m_dEdbu = np.zeros_like(self.bu)
+        self.m_dEdbv = np.zeros_like(self.bv)
+
+        self.v_dEdbu = np.zeros_like(self.bu)
+        self.v_dEdbv = np.zeros_like(self.bv)
+
+        # Number of times we have updated by adam
+        # (needed for bias correction)
+        self.t = 1
+
         # Set all gradients to zero
         self._resetGradients()
     
@@ -197,7 +231,7 @@ class ElmanNetwork():
         #print(self.dEdbv.shape)
         self.dEdbv += dEdv.reshape(self.dEdbv.shape)
         self.dEdbu += dEdu.reshape(self.dEdbu.shape)
-        
+
         # We need this back at the end, otherwise we can't compute the next step
         return dEdu
     
@@ -261,20 +295,55 @@ class ElmanNetwork():
     def updateParameters(self):
         """
         Update the learning parameters from the stored gradients
-        (up to first order).
+        using the Adam optimization scheme.
         """
-        # Update via (first order) gradient descent
+
+        # Update momentum terms
+        self.m_dEdWux = self.beta1 * self.m_dEdWux + (1 - self.beta1) * self.dEdWux
+        self.m_dEdWuc = self.beta1 * self.m_dEdWuc + (1 - self.beta1) * self.dEdWuc
+        self.m_dEdWvc = self.beta1 * self.m_dEdWvc + (1 - self.beta1) * self.dEdWvc
+
+        self.m_dEdbu = self.beta1 * self.m_dEdbu + (1 - self.beta1) * self.dEdbu
+        self.m_dEdbv = self.beta1 * self.m_dEdbv + (1 - self.beta1) * self.dEdbv
+
+        # Update rms terms
+        self.v_dEdWux = self.beta2 * self.v_dEdWux + (1 - self.beta2) * self.dEdWux**2
+        self.v_dEdWuc = self.beta2 * self.v_dEdWuc + (1 - self.beta2) * self.dEdWuc**2
+        self.v_dEdWvc = self.beta2 * self.v_dEdWvc + (1 - self.beta2) * self.dEdWvc**2
+
+        self.v_dEdbu = self.beta2 * self.v_dEdbu + (1 - self.beta2) * self.dEdbu**2
+        self.v_dEdbv = self.beta2 * self.v_dEdbv + (1 - self.beta2) * self.dEdbv**2
+
+        # Bias correction
+        m_corr = 1 - self.beta1**self.t
+        v_corr = 1 - self.beta2**self.t
+
+        eps = 1e-8 # Some very small value to prevent div by 0 errors
+
+        # Now actually update everything
         # Weights
-        self.Wvc -= self.dEdWvc * self.learningRate
-        self.Wuc -= self.dEdWuc * self.learningRate
-        self.Wux -= self.dEdWux * self.learningRate
+        dWvc = self.m_dEdWvc * self.learningRate / m_corr / (np.sqrt(self.v_dEdWvc / v_corr) + eps)
+        dWuc = self.m_dEdWuc * self.learningRate / m_corr / (np.sqrt(self.v_dEdWuc / v_corr) + eps)
+        dWux = self.m_dEdWux * self.learningRate / m_corr / (np.sqrt(self.v_dEdWux / v_corr) + eps)
         # Biases
-        self.bv -= self.dEdbv * self.learningRate
-        self.bu -= self.dEdbu * self.learningRate
-        
-        # And reset gradients so we don't accidentally update
+        dbv = self.m_dEdbv * self.learningRate / m_corr / (np.sqrt(self.v_dEdbv / v_corr) + eps)
+        dbu = self.m_dEdbu * self.learningRate / m_corr / (np.sqrt(self.v_dEdbu / v_corr) + eps)
+
+        # Reset gradients so we don't accidentally update
         # twice
         self._resetGradients()
+
+        # Increment the update counter (used for bias)
+        self.t += 1
+
+        #sumArr = [np.sum(dWvc), np.sum(dWuc), np.sum(dWux), np.sum(dbv), np.sum(dbu)]
+
+        self.Wvc -= dWvc
+        self.Wuc -= dWuc
+        self.Wux -= dWux
+
+        self.bu -= dbu
+        self.bv -= dbv
     
         
     def predict(self, inputArr, predictionSteps=1):
